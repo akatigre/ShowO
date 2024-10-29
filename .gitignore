@@ -1,0 +1,8 @@
+wandb/**
+docs/**
+accelerate_configs/**
+logs/**
+mmu_validation/**
+outputs/**
+validation_prompts/**
+tmp.py

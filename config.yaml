@@ -1,0 +1,71 @@
+prompts: "/home/server08/yoonjeon_workspace/MMAR/prompts.txt"
+mode: "t2i"
+
+seed: 12
+pag_scale: 0.0
+cfg_scale: 5.0
+layer_types: "late"
+cd_beta: 0.1
+batch_size: 4
+generation_temperature: 1.0
+generation_timesteps: 50
+
+defaults:
+  - override /hydra/hydra_logging@_group_: none
+  - override /hydra/job_logging@_group_: none
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+
+wandb:
+  entity: 'jeoni'
+  resume: 'auto'
+  project: 'Show-O'
+  sweep_name: "showo-512x512"
+
+model:
+    vq_model:
+        type: "magvitv2"
+        vq_model_name: "showlab/magvitv2"
+    showo:
+        pretrained_model_path: "showlab/show-o-512x512"
+        w_clip_vit: False
+        vocab_size: 58498
+        llm_vocab_size: 50295
+        llm_model_path: 'microsoft/phi-1_5'
+        codebook_size: 8192
+        num_vq_tokens: 1024
+        num_new_special_tokens: 10  # <|soi|> <|eoi|> <|sov|> <|eov|> <|t2i|> <|mmu|> <|t2v|> <|v2v|> <|lvg|> <|pad|>
+
+    gradient_checkpointing: True
+
+dataset:
+    gen_type: "t2i"
+    und_type: "captioning"
+    params:
+        batch_size: ${training.batch_size}
+        shuffle_buffer_size: 1000
+        num_workers: 32
+        resolution: 512
+        pin_memory: True
+        persistent_workers: True
+
+    preprocessing:
+        max_seq_length: 128
+        resolution: 512
+        center_crop: False
+        random_flip: False
+
+training:
+    gradient_accumulation_steps: 1
+    cond_dropout_prob: 0.1
+    batch_size: 20
+    cfg_scale: ${cfg_scale}
+    pag_scale: ${pag_scale}
+    layer_types: ${layer_types}
+    cd_beta: ${cd_beta}
+    generation_temperature: ${generation_temperature}
+    generation_timesteps: ${generation_timesteps}
+    seed: ${seed}

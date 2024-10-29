@@ -210,7 +210,8 @@ def main(cfg: DictConfig):
                             input_ids=model_input, 
                             attention_mask=attention_mask,
                             enable_cfg=enable_cfg,
-                            cfg_scale=cfg_scale,
+                            enable_pag=enable_pag,
+                            use_cache=False,
                             prefix_len=len(input_ids),
                             )['logits'].chunk(2)
                     logits = (1 + pag_scale) * cond_logits - pag_scale * pag_logits
@@ -227,7 +228,8 @@ def main(cfg: DictConfig):
                             input_ids=model_input, 
                             attention_mask=attention_mask,
                             enable_cfg=enable_cfg,
-                            cfg_scale=cfg_scale,
+                            enable_pag=enable_pag,
+                            use_cache=False,
                             prefix_len=len(input_ids),
                             )['logits'].chunk(3)
                     logits = (2 + cfg_scale - pag_scale) * cond_logits - cfg_scale * uncond_logits + pag_scale * pag_logits

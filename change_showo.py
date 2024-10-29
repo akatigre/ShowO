@@ -336,16 +336,29 @@ def cfg_pag_forward(model: PhiSdpaAttention):
         # cond, cfg, pag | cond, cfg | cond, pag | cond
         if enable_cfg and enable_pag:
             hidden_states_cond, hidden_states_uncond, hidden_states_pag = hidden_states.chunk(3)
-            hidden_states = torch.cat([hidden_states_cond, hidden_states_uncond], dim=0)
+            attention_mask_cond, attention_mask_uncond, attention_mask_pag = attention_mask.chunk(3)
+            if self.pag_layer:
+                hidden_states = torch.cat([hidden_states_cond, hidden_states_uncond], dim=0)
+                attention_mask = torch.cat([attention_mask_cond, attention_mask_uncond], dim=0)
+            else:
+                pass
         elif enable_cfg and not enable_pag:
             hidden_states_cond, hidden_states_uncond = hidden_states.chunk(2)
-            hidden_states_pag = None
+            attention_mask_cond, attention_mask_uncond = attention_mask.chunk(2)
+            hidden_states, attention_mask = hidden_states_cond, attention_mask_cond
+            hidden_states_pag, attention_mask_pag = None
         elif not enable_cfg and enable_pag:
             hidden_states_cond, hidden_states_pag = hidden_states.chunk(2)
-            hidden_states = hidden_states_cond
+            attention_mask_cond, attention_mask_pag = attention_mask.chunk(2)
             hidden_states_uncond = None
+            if self.pag_layer:
+                hidden_states, attention_mask = hidden_states_cond, attention_mask_cond
+            else:
+                pass
+            
         else:
             hidden_states_cond, hidden_states_uncond, hidden_states_pag = None, None, None
+            attention_mask_cond, attention_mask_uncond, attention_mask_pag = None, None, None
             pass 
 
         bsz, q_len, _ = hidden_states.size()
@@ -430,9 +443,22 @@ def cfg_pag_forward(model: PhiSdpaAttention):
             key_states_ptb = key_states_ptb.view(bsz_ptb, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
             value_states_ptb = value_states_ptb.view(bsz_ptb, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-            cos, sin = self.rotary_emb(value_states, position_ids)
-            query_states_ptb, key_states_ptb = apply_rotary_pos_emb(query_states_ptb, key_states_ptb, cos, sin)
+            cos, sin = self.rotary_emb(value_states_ptb, seq_len=kv_seq_len)
+            # Partial rotary embedding
+            query_rot, query_pass = (
+                query_states_ptb[..., : self.rotary_emb.dim],
+                query_states_ptb[..., self.rotary_emb.dim :],
+            )
+            key_rot, key_pass = (
+                key_states_ptb[..., : self.rotary_emb.dim],
+                key_states_ptb[..., self.rotary_emb.dim :],
+            )
+            # [batch_size, seq_length, num_heads, head_dim // config.partial_rotary_factor]
+            query_rot, key_rot = apply_rotary_pos_emb(query_rot, key_rot, cos, sin, position_ids)
 
+            # [batch_size, seq_length, num_heads, head_dim]
+            query_states_ptb = torch.cat((query_rot, query_pass), dim=-1)
+            key_states_ptb = torch.cat((key_rot, key_pass), dim=-1)
     
             if past_key_value_pag is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -440,25 +466,24 @@ def cfg_pag_forward(model: PhiSdpaAttention):
                 key_states_ptb, value_states_ptb = past_key_value_pag.update(key_states_ptb, value_states_ptb, self.layer_idx, cache_kwargs)
         
         ########### PAG path ############
-        enable_pag = False
         if enable_pag and self.pag_layer:    
                 
             key_states_ptb = repeat_kv(key_states_ptb, self.num_key_value_groups)
             value_states_ptb = repeat_kv(value_states_ptb, self.num_key_value_groups)
-
-            k_len = key_states_ptb.size(2)
-            attention_mask = torch.zeros((q_len, k_len), device=query_states_ptb.device, dtype=query_states_ptb.dtype)
-            attention_mask[ : , prefix_len : -1] = float("-inf")
+            if self.require_contiguous_qkv and query_states.device.type == "cuda" and attention_mask is not None:
+                query_states_ptb = query_states_ptb.contiguous()
+                key_states_ptb = key_states_ptb.contiguous()
+                value_states_ptb = value_states_ptb.contiguous()
+            attention_mask_pag[ ... , prefix_len : -1] = float("-inf")
 
             # expand the mask to match the attention weights shape
-            attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)  # Add batch and num_heads dimensions
             attn_output_ptb = torch.nn.functional.scaled_dot_product_attention(
                 query_states_ptb,
                 key_states_ptb,
                 value_states_ptb,
-                attention_mask,
-                dropout_p = self.attention_dropout if self.training else 0.0,
-                is_causal = True if q_len > 1 else False
+                attn_mask=attention_mask_pag,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=is_causal,
             )
             attn_output_ptb = attn_output_ptb.transpose(1, 2).contiguous()
             attn_output_ptb = attn_output_ptb.view(bsz_ptb, q_len, -1)

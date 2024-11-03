@@ -2,7 +2,7 @@ prompts: "/home/server08/yoonjeon_workspace/MMAR/prompts.txt"
 mode: "t2i"
 
 seed: 12
-pag_scale: 0.4
+pag_scale: 0.9
 cfg_scale: 5.0
 layer_types: "late"
 cd_beta: 0.1

@@ -345,8 +345,7 @@ def cfg_pag_forward(model: PhiSdpaAttention):
         elif enable_cfg and not enable_pag:
             hidden_states_cond, hidden_states_uncond = hidden_states.chunk(2)
             attention_mask_cond, attention_mask_uncond = attention_mask.chunk(2)
-            hidden_states, attention_mask = hidden_states_cond, attention_mask_cond
-            hidden_states_pag, attention_mask_pag = None
+            hidden_states_pag, attention_mask_pag = None, None
         elif not enable_cfg and enable_pag:
             hidden_states_cond, hidden_states_pag = hidden_states.chunk(2)
             attention_mask_cond, attention_mask_pag = attention_mask.chunk(2)

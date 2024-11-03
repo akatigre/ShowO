@@ -141,7 +141,7 @@ def main(cfg: DictConfig):
                 uncond_input_ids = None
 
             if cfg.pag_scale > 0:
-                pag_input_ids, _ = uni_prompting(([''] * batch_size, image_tokens), 't2i_gen')
+                pag_input_ids, _ = uni_prompting(([prompt] * batch_size, image_tokens), 't2i_gen')
                 total_input_ids.append(pag_input_ids)
 
             else:
@@ -281,6 +281,7 @@ def main(cfg: DictConfig):
         images = images.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
         pil_images = [Image.fromarray(image) for image in images]
         wandb_images = [wandb.Image(image, caption=prompt) for i, image in enumerate(pil_images)]
+
         wandb.log(
             {
                 folder_name: wandb_images

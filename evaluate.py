@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import os
-import json
 from pathlib import Path
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 from PIL import Image
@@ -27,18 +26,17 @@ from training.prompting_utils import UniversalPrompting, create_attention_mask_p
 from transformers import AutoTokenizer
 from change_showo import change_showo_forward, change_phi_forward, change_phi_decoder_layer_forward, cfg_pag_forward
 
-import numpy as np
-
-import wandb
 import hydra
+from collections import defaultdict
 from omegaconf import DictConfig, OmegaConf
 
 from run_image_generation import inpaint, extrapolate
 from models.sampling import mask_by_random_topk
 from change_showo import change_phi_forward, change_phi_decoder_layer_forward, cfg_pag_forward
-from utils import set_seed
+from utils import set_seed, load_metadata
 import logging
 from rich.logging import RichHandler
+os.system('export PYTHONPATH="${PYTHONPATH}:/home/server08/yoonjeon_workspace/MMAR"')
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,9 +47,11 @@ logging.basicConfig(
 log = logging.getLogger("rich")
 log.setLevel(logging.INFO)
 
-wandb.offline = True
-@hydra.main(config_path=".", config_name="showo_config")
+@hydra.main(config_path="../configs", config_name="config")
 def main(cfg: DictConfig):
+    model_params = cfg.model_params
+    assert model_params.model_name == "Show-o", "Model name should be Show-o"
+    
     set_seed(seed=cfg.seed)
     log.info(f"Set seed {cfg.seed}")
     enable_pag = cfg.pag_scale > 0.0
@@ -60,46 +60,37 @@ def main(cfg: DictConfig):
     log.info(f"Enable PAG: {enable_pag}, Enable CFG: {enable_cfg}, Enable CD: {enable_cd}")
     
     # Create folder to save images
+    output_path = str(Path(cfg.benchmark.outdirs) / cfg.model_params.model_name)
+    log.info(f"Output path: {output_path}")
     folder_name = "generated"
     if enable_pag: 
         folder_name += f"_pag:{cfg.pag_scale}_layer:{cfg.layer_types}"
-        cfg.outdir += f"_PAG_{cfg.pag_scale}"
+        output_path += f"_PAG_{cfg.pag_scale}"
     if enable_cfg: 
         folder_name += f"_cfg{cfg.cfg_scale}"
-        cfg.outdir += f"_CFG_{cfg.cfg_scale}"
+        output_path += f"_CFG_{cfg.cfg_scale}"
     if enable_cd:
         folder_name += f"_cd{cfg.cd_beta}"
-        cfg.outdir += f"_CD_{cfg.cd_beta}"
+        output_path += f"_CD_{cfg.cd_beta}"
 
-    with open(cfg.metadata_file) as f:
-        metadatas = [json.loads(line) for line in f]
-
-    wandb.init(
-        project=cfg.wandb.project,
-        entity=cfg.wandb.entity,
-        config=OmegaConf.to_container(cfg, resolve=True),
-        settings=wandb.Settings(code_dir=os.getcwd())
-    )
-    wandb.run.log_code("/home/server08/yoonjeon_workspace/MMAR/Show-o", include_fn=lambda path: path.endswith(".py"))
-
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model.showo.llm_model_path, padding_side="left")
-
-    uni_prompting = UniversalPrompting(tokenizer, max_text_len=cfg.dataset.preprocessing.max_seq_length,
+    tokenizer = AutoTokenizer.from_pretrained(model_params.model.showo.llm_model_path, padding_side="left")
+    uni_prompting = UniversalPrompting(tokenizer, max_text_len=model_params.dataset.preprocessing.max_seq_length,
                                        special_tokens=("<|soi|>", "<|eoi|>", "<|sov|>", "<|eov|>", "<|t2i|>", "<|mmu|>", "<|t2v|>", "<|v2v|>", "<|lvg|>"),
-                                       ignore_id=-100, cond_dropout_prob=cfg.training.cond_dropout_prob)
+                                       ignore_id=-100, cond_dropout_prob=model_params.training.cond_dropout_prob)
 
-    vq_model = get_vq_model_class(cfg.model.vq_model.type)
-    vq_model = vq_model.from_pretrained(cfg.model.vq_model.vq_model_name).to(device)
+    vq_model = get_vq_model_class(model_params.model.vq_model.type)
+    vq_model = vq_model.from_pretrained(model_params.model.vq_model.vq_model_name).to(device)
     vq_model.requires_grad_(False)
     vq_model.eval()
 
-    model = Showo.from_pretrained(cfg.model.showo.pretrained_model_path).to(device)
+    model = Showo.from_pretrained(model_params.model.showo.pretrained_model_path).to(device)
     model.eval()
 
     #! Change layer forward functions to support PAG
     decoder_layers = model.showo.model.layers
-    batch_size = cfg.batch_size
+    batch_size = cfg.benchmark.batch
     if cfg.layer_types=="all":
         layer_idxs = range(len(decoder_layers))
     elif cfg.layer_types=="early":
@@ -124,25 +115,33 @@ def main(cfg: DictConfig):
     log.info("Layer structure changed successfully")
     mask_token_id = model.config.mask_token_id
  
+    val_prompts = load_metadata(cfg)
+    categories = val_prompts.get("categories", None)
     # load from users passed arguments
-    for p_idx, metadata in tqdm(enumerate(metadatas)):
-        outpath = os.path.join(cfg.outdir, f"{p_idx:0>5}")
-        os.makedirs(outpath, exist_ok=True)
-
-        prompt = metadata['prompt']
-        sample_path = os.path.join(outpath, "samples")
-        os.makedirs(sample_path, exist_ok=True)
-        with open(os.path.join(outpath, "metadata.jsonl"), "w") as fp:
-            json.dump(metadata, fp)
-
+    for idx, (prompt, name) in tqdm(enumerate(zip(val_prompts['prompts'], val_prompts['name'])), desc="Generating images"):
+        
+        cat = categories[idx] if categories is not None else None
+        outpath = Path(output_path) / name if cat is None else Path(output_path) / cat / name
+        
+        if cfg.benchmark.name=="geneval":
+            os.makedirs(outpath, exist_ok=True)
+            if len(os.listdir(outpath)) > batch_size:
+                continue
+        elif cfg.benchmark.name=="mjhq" or cfg.benchmark.name=="dpgbench":
+            os.makedirs(outpath.parent, exist_ok=True)
+            if os.path.exists(outpath):
+                continue
+        else:
+            raise ValueError(f"benchmark name {cfg.benchmark.name} not supported.")
+        
         log.info(f"With Prompt '{prompt}' generating {batch_size} images")
-        # load from users passed arguments
-        if cfg.mode == "inpainting":
+        
+        if cfg.model_params.mode == "inpainting":
             images = inpaint(cfg, model, vq_model, uni_prompting, device, mask_token_id)
-        elif cfg.mode == 'extrapolation':
+        elif cfg.model_params.mode == 'extrapolation':
             images = extrapolate(cfg, model, vq_model, uni_prompting, device, mask_token_id)
-        elif cfg.mode == 't2i':
-            image_tokens = torch.ones((batch_size, cfg.model.showo.num_vq_tokens),
+        elif cfg.model_params.mode == 't2i':
+            image_tokens = torch.ones((batch_size, model_params.model.showo.num_vq_tokens),
                                         dtype=torch.long, device=device) * mask_token_id
 
             input_ids, _ = uni_prompting(([prompt] * batch_size, image_tokens), 't2i_gen')
@@ -170,44 +169,43 @@ def main(cfg: DictConfig):
                                                                 eoi_id=int(uni_prompting.sptids_dict['<|eoi|>']),
                                                                 rm_pad_in_image=True)
 
-            if cfg.get("mask_schedule", None) is not None:
-                schedule = cfg.mask_schedule.schedule
-                args = cfg.mask_schedule.get("params", {})
+            if model_params.get("mask_schedule", None) is not None:
+                schedule = model_params.mask_schedule.schedule
+                args = model_params.mask_schedule.get("params", {})
                 mask_schedule = get_mask_chedule(schedule, **args)
             else:
-                mask_schedule = get_mask_chedule(cfg.training.get("mask_schedule", "cosine"))
+                mask_schedule = get_mask_chedule(model_params.training.get("mask_schedule", "cosine"))
             
             
             cfg_scale = cfg.cfg_scale
             pag_scale = cfg.pag_scale
-            temperature = cfg.training.generation_temperature
-            timesteps = cfg.training.generation_timesteps
+            temperature = model_params.generation_temperature
+            timesteps = model_params.generation_timesteps
             noise_schedule = mask_schedule
             # begin with all image token ids masked
-            num_vq_tokens = cfg.model.showo.num_vq_tokens
-            num_new_special_tokens = cfg.model.showo.num_new_special_tokens
+            num_vq_tokens = model_params.model.showo.num_vq_tokens
+            num_new_special_tokens = model_params.model.showo.num_new_special_tokens
 
             input_ids_minus_lm_vocab_size = input_ids[:, -(num_vq_tokens + 1):-1].clone()
             input_ids_minus_lm_vocab_size = torch.where(input_ids_minus_lm_vocab_size == mask_token_id,
                                                         mask_token_id,
-                                                        input_ids_minus_lm_vocab_size - cfg.model.showo.llm_vocab_size - num_new_special_tokens)
+                                                        input_ids_minus_lm_vocab_size - model_params.model.showo.llm_vocab_size - num_new_special_tokens)
 
             # for classifier-free guidance
             if uncond_input_ids is not None:
-                uncond_prefix = uncond_input_ids[:, :cfg.dataset.preprocessing.max_seq_length + 1]
+                uncond_prefix = uncond_input_ids[:, :model_params.dataset.preprocessing.max_seq_length + 1]
 
             if pag_input_ids is not None:
-                pag_prefix = pag_input_ids[:, :cfg.dataset.preprocessing.max_seq_length + 1]
+                pag_prefix = pag_input_ids[:, :model_params.dataset.preprocessing.max_seq_length + 1]
             
             enable_cfg = uncond_input_ids is not None and cfg_scale > 0
             enable_pag = pag_input_ids is not None and pag_scale > 0
 
-            from collections import defaultdict
             extras = defaultdict(list)
             for step in range(timesteps): # cond | cond, uncond | cond, pag | cond, uncond, pag
                 if enable_cfg and not enable_pag:
                     uncond_input_ids = torch.cat(
-                        [uncond_prefix, input_ids[:, cfg.dataset.preprocessing.max_seq_length + 1:]], dim=1)
+                        [uncond_prefix, input_ids[:, model_params.dataset.preprocessing.max_seq_length + 1:]], dim=1)
                     model_input = torch.cat([input_ids, uncond_input_ids])
                     with torch.no_grad():
                         cond_logits, uncond_logits = model.showo(
@@ -222,7 +220,7 @@ def main(cfg: DictConfig):
                     logits = (1 + cfg_scale) * cond_logits - cfg_scale * uncond_logits
                 elif enable_pag and not enable_cfg:
                     pag_input_ids = torch.cat(
-                        [pag_prefix, input_ids[:, cfg.dataset.preprocessing.max_seq_length + 1:]], dim=1)
+                        [pag_prefix, input_ids[:, model_params.dataset.preprocessing.max_seq_length + 1:]], dim=1)
                     model_input = torch.cat([input_ids, pag_input_ids])
                     with torch.no_grad():
                         cond_logits, pag_logits = model.showo(
@@ -237,9 +235,9 @@ def main(cfg: DictConfig):
 
                 elif enable_pag and enable_cfg:
                     uncond_input_ids = torch.cat(
-                        [uncond_prefix, input_ids[:, cfg.dataset.preprocessing.max_seq_length + 1:]], dim=1)
+                        [uncond_prefix, input_ids[:, model_params.dataset.preprocessing.max_seq_length + 1:]], dim=1)
                     pag_input_ids = torch.cat(
-                        [pag_prefix, input_ids[:, cfg.dataset.preprocessing.max_seq_length + 1:]], dim=1)
+                        [pag_prefix, input_ids[:, model_params.dataset.preprocessing.max_seq_length + 1:]], dim=1)
                     model_input = torch.cat([input_ids, uncond_input_ids, pag_input_ids])
                     with torch.no_grad():
                         # cond_logits, uncond_logits, pag_logits = model(model_input, attention_mask=attention_mask).chunk(3)
@@ -257,7 +255,7 @@ def main(cfg: DictConfig):
                     with torch.no_grad():
                         logits = model(input_ids, attention_mask=attention_mask)
                     
-                logits = logits[:, -(num_vq_tokens + 1):-1, cfg.model.showo.llm_vocab_size + num_new_special_tokens:-1]
+                logits = logits[:, -(num_vq_tokens + 1):-1, model_params.model.showo.llm_vocab_size + num_new_special_tokens:-1]
                 topk_logits = logits.topk(100, dim=-1)
                 extras["logit_hist_vals"].append(topk_logits.values)
                 extras["logit_hist_inds"].append(topk_logits.indices)
@@ -289,40 +287,47 @@ def main(cfg: DictConfig):
                 masking = mask_by_random_topk(mask_len, selected_probs, temperature, generator=None)
                 # Masks tokens with lower confidence.
                 input_ids[:, -(num_vq_tokens + 1):-1] = torch.where(masking, mask_token_id,
-                                                            sampled_ids + cfg.model.showo.llm_vocab_size
+                                                            sampled_ids + model_params.model.showo.llm_vocab_size
                                                             + num_new_special_tokens)
                 input_ids_minus_lm_vocab_size = torch.where(masking, mask_token_id, sampled_ids)
 
-            sampled_ids = torch.clamp(sampled_ids, max=cfg.model.showo.codebook_size - 1, min=0)
+            sampled_ids = torch.clamp(sampled_ids, max=model_params.model.showo.codebook_size - 1, min=0)
             images = vq_model.decode_code(sampled_ids)
         else:
-            raise ValueError(f"mode {cfg.mode} not supported.")
+            raise ValueError(f"mode {model_params.mode} not supported.")
         
         images = torch.clamp((images + 1.0) / 2.0, min=0.0, max=1.0)
         images *= 255.0
-        images = images.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
-        pil_images = [Image.fromarray(image) for image in images]
         
-        sample_count = 0
-        for sample in pil_images:
-            sample.save(os.path.join(sample_path, f"{sample_count:05}.png"))
-            sample_count += 1
-
-        wandb_images = [wandb.Image(image, caption=prompt) for i, image in enumerate(pil_images)]
-
-        wandb.log(
-            {
-                folder_name: wandb_images
-            },
-            step=p_idx
-        )
-        
-        out_dir = Path(f"{sample_path}/geneval")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(extras, out_dir / "extras.pt")
-        torch.save(sampled_ids, out_dir / "generated_tokens.pt")
-        wandb.save(str(out_dir) + "/*", policy="end")
-
+        if cfg.benchmark.name=="geneval":
+            images = images.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+            pil_images = [Image.fromarray(image) for image in images]
+            sample_count = 0
+            for sample in pil_images:
+                sample.save(os.path.join(outpath, f"{sample_count:05}.png"))
+                sample_count += 1
+            (Path(outpath) / str(sample_count)).mkdir(exist_ok=True)
+            torch.save(extras, Path(outpath) / str(sample_count) / "extras.pt")
+            torch.save(sampled_ids, Path(outpath) / str(sample_count)/ "generated_tokens.pt")
+        elif cfg.benchmark.name=="dpgbench":
+            from torchvision.utils import make_grid
+            images = make_grid(images, nrow=2)
+            images = images.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+            images = Image.fromarray(images)
+            images.save(outpath)
+            (Path(outpath.parent) / outpath.stem).mkdir(exist_ok=True)
+            torch.save(extras, Path(outpath.parent) / outpath.stem / "extras.pt")
+            torch.save(sampled_ids, Path(outpath.parent) / outpath.stem / "generated_tokens.pt")
+        elif cfg.benchmark.name=="mjhq":
+            images = images.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+            images = Image.fromarray(images[0])
+            images.save(outpath)
+            (Path(outpath.parent) / outpath.stem).mkdir(exist_ok=True)
+            torch.save(extras, Path(outpath.parent) / outpath.stem / "extras.pt")
+            torch.save(sampled_ids, Path(outpath.parent) / outpath.stem / "generated_tokens.pt")
+        else:
+            raise ValueError(f"benchmark name {cfg.benchmark.name} not supported.")
+        log.info(f"Generated image saved at {outpath}")
 
 def get_vq_model_class(model_type):
     if model_type == "magvitv2":

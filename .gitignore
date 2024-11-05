@@ -6,3 +6,5 @@ mmu_validation/**
 outputs/**
 validation_prompts/**
 tmp.py
+multirun/**
+*.log
